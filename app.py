@@ -7,6 +7,7 @@ import io
 import math
 import base64
 import json
+import re
 import folium
 from streamlit_folium import st_folium
 from openai import OpenAI
@@ -14,9 +15,9 @@ from openai import OpenAI
 # --- 1. CONFIGURATIE & UI ---
 st.set_page_config(page_title="Franse Huizen Zoeker AI", layout="wide")
 st.title("🏡 Franse Huizen Geolocation Tool (met GPT-4o Vision)")
-st.markdown("Upload buitenfoto's van een makelaars-advertentie. **GPT-4o Vision** ontleed het huis op satellietkenmerken en doorzoekt de Franse luchtfoto's (IGN) binnen de zoekcirkel.")
+st.markdown("Upload buitenfoto's van een makelaars-advertentie en geef de locatie op via URL, plaatsnaam of coördinaten.")
 
-# Installeer/check OpenAI Client
+# OpenAI Client setup
 api_key = st.secrets.get("OPENAI_API_KEY", None)
 if api_key:
     client = OpenAI(api_key=api_key)
@@ -24,7 +25,34 @@ else:
     client = None
     st.warning("⚠️ Geen `OPENAI_API_KEY` gevonden in Streamlit Secrets. AI-fotoanalyse staat uit totdat de sleutel is ingesteld.")
 
-# --- 2. AI FOTO-ANALYSE FUNCTIE ---
+# --- 2. HULPFUNCTIES VOOR LOCATIE EN URL ---
+def extract_coords_from_url(url: str):
+    """Haalt automatisch coördinaten uit een Bien'ici of Google Maps URL."""
+    match_bienici = re.search(r'camera=\d+_([0-9.-]+)_([0-9.-]+)', url)
+    if match_bienici:
+        lon = float(match_bienici.group(1))
+        lat = float(match_bienici.group(2))
+        return lat, lon
+    
+    match_gmaps = re.search(r'@([0-9.-]+),([0-9.-]+)', url)
+    if match_gmaps:
+        return float(match_gmaps.group(1)), float(match_gmaps.group(2))
+        
+    return None
+
+def geocode_french_town(town_name: str):
+    """Zet een Franse plaatsnaam/postcode om naar GPS-coördinaten via de overheids-API."""
+    url = f"https://api-adresse.data.gouv.fr/search/?q={town_name}&limit=1"
+    try:
+        res = requests.get(url, timeout=5).json()
+        if res.get('features'):
+            coords = res['features'][0]['geometry']['coordinates']
+            return coords[1], coords[0]
+    except Exception:
+        pass
+    return None
+
+# --- 3. AI FOTO-ANALYSE FUNCTIE ---
 def analyze_photo_with_gpt4o(image_bytes):
     """Gebruikt GPT-4o Vision om de foto te analyseren op satelliet-herkenbare kenmerken."""
     if not client:
@@ -72,7 +100,7 @@ def analyze_photo_with_gpt4o(image_bytes):
         st.error(f"Fout bij AI analyse: {e}")
         return None
 
-# --- 3. IGN SATELLIET & MATH HULPFUNCTIES ---
+# --- 4. IGN SATELLIET & MATH HULPFUNCTIES ---
 def deg2num(lat_deg, lon_deg, zoom):
     lat_rad = math.radians(lat_deg)
     n = 2.0 ** zoom
@@ -103,7 +131,7 @@ def scan_tile_features(pil_image, ai_analysis):
     hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
     matches = []
 
-    # Als AI aangeeft dat er een zwembad is: zoek blauw
+    # Zoek naar zwembaden als AI een zwembad ziet
     if ai_analysis and ai_analysis.get("heeft_zwembad"):
         lower_blue = np.array([80, 50, 50])
         upper_blue = np.array([130, 255, 255])
@@ -114,7 +142,7 @@ def scan_tile_features(pil_image, ai_analysis):
                 x, y, w, h = cv2.boundingRect(cnt)
                 matches.append({"x": x + w/2, "y": y + h/2, "type": "Zwembad Match"})
 
-    # Zoek naar rode/oranje daken als AI een rood dak detecteert
+    # Zoek naar rode/oranje daken
     dak_kleur = str(ai_analysis.get("dak_kleur", "")).lower() if ai_analysis else ""
     if "rood" in dak_kleur or "oranje" in dak_kleur or "dakpan" in dak_kleur:
         lower_red1 = np.array([0, 70, 50])
@@ -127,28 +155,50 @@ def scan_tile_features(pil_image, ai_analysis):
         contours, _ = cv2.findContours(mask_red, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if 100 < area < 2000: # Schaal voor een huisdak op zoom 17
+            if 100 < area < 2000:
                 x, y, w, h = cv2.boundingRect(cnt)
                 matches.append({"x": x + w/2, "y": y + h/2, "type": "Gebouw/Dak Match"})
 
     return matches
 
-# --- 4. SIDEBAR INPUTS ---
+# --- 5. SIDEBAR INPUTS (CORRECT INGESPRONGEN) ---
 with st.sidebar:
     st.header("1. Upload Makelaarsfoto's")
     uploaded_file = st.file_uploader("Kies een buitenfoto van het huis", type=["jpg", "jpeg", "png"])
     
-    st.header("2. Coördinaten van de cirkel")
-    st.caption("Plaats de Midden-coördinaten van de cirkel op de kaart (bijv. van Bien'ici of Google Maps).")
-    # Standaard ingesteld op de regio Aynac (46120) uit jouw voorbeeldlink
-    lat_input = st.number_input("Latitude", value=44.784400, format="%.6f")
-    lon_input = st.number_input("Longitude", value=1.851700, format="%.6f")
+    st.header("2. Locatie bepalen")
+    location_method = st.radio("Kies invoermethode:", ["Link/URL plakken", "Plaatsnaam / Postcode", "Handmatig Lat/Lon"])
     
+    lat_input, lon_input = 44.891237, 1.832689  # Standaard coördinaten uit jouw Bien'ici voorbeeld
+    
+    if location_method == "Link/URL plakken":
+        listing_url = st.text_input("Plak de advertentie URL (bijv. van Bien'ici):")
+        if listing_url:
+            extracted = extract_coords_from_url(listing_url)
+            if extracted:
+                lat_input, lon_input = extracted
+                st.success(f"📍 Coördinaten gevonden: {lat_input:.5f}, {lon_input:.5f}")
+            else:
+                st.warning("Kon geen automatische coördinaten in deze URL vinden.")
+                
+    elif location_method == "Plaatsnaam / Postcode":
+        town_input = st.text_input("Plaatsnaam of postcode:", value="Aynac 46120")
+        if town_input:
+            geo_coords = geocode_french_town(town_input)
+            if geo_coords:
+                lat_input, lon_input = geo_coords
+                st.success(f"📍 Centrum van {town_input}: {lat_input:.5f}, {lon_input:.5f}")
+            else:
+                st.error("Plaatsnaam niet gevonden.")
+
+    elif location_method == "Handmatig Lat/Lon":
+        lat_input = st.number_input("Latitude", value=44.891237, format="%.6f")
+        lon_input = st.number_input("Longitude", value=1.832689, format="%.6f")
+
     grid_size = st.slider("Zoekbereik (grid grootte)", min_value=1, max_value=7, value=3, step=2)
-    
     start_search = st.button("Start AI Analyse & Zoekopdracht 🚀", type="primary")
 
-# --- 5. HOOFDLOGICA ---
+# --- 6. HOOFDLOGICA ---
 ai_data = None
 
 if uploaded_file:
@@ -214,62 +264,3 @@ if start_search:
         ).add_to(m)
         
     st_folium(m, width=1000, height=600)
-import re
-from urllib.parse import unquote
-
-def extract_coords_from_url(url: str):
-    """Haalt automatisch coördinaten uit een Bien'ici of Google Maps URL."""
-    # Bien'ici camera parameter: camera=zoom_lon_lat_...
-    match_bienici = re.search(r'camera=\d+_([0-9.-]+)_([0-9.-]+)', url)
-    if match_bienici:
-        lon = float(match_bienici.group(1))
-        lat = float(match_bienici.group(2))
-        return lat, lon
-    
-    # Google Maps parameter: @lat,lon
-    match_gmaps = re.search(r'@([0-9.-]+),([0-9.-]+)', url)
-    if match_gmaps:
-        return float(match_gmaps.group(1)), float(match_gmaps.group(2))
-        
-    return None
-
-def geocode_french_town(town_name: str):
-    """Zet een Franse plaatsnaam/postcode om naar GPS-coördinaten via de overheids-API."""
-    url = f"https://api-adresse.data.gouv.fr/search/?q={town_name}&limit=1"
-    try:
-        res = requests.get(url, timeout=5).json()
-        if res.get('features'):
-            coords = res['features'][0]['geometry']['coordinates']
-            return coords[1], coords[0] # Lat, Lon
-    except Exception:
-        pass
-    return None
-    with st.sidebar:
-    st.header("2. Locatie bepalen")
-    location_method = st.radio("Kies invoermethode:", ["Link/URL plakken", "Plaatsnaam / Postcode", "Handmatig Lat/Lon"])
-    
-    lat_input, lon_input = 44.784400, 1.851700 # Standaardwaarden (Aynac)
-    
-    if location_method == "Link/URL plakken":
-        listing_url = st.text_input("Plak de advertentie URL (bijv. van Bien'ici):")
-        if listing_url:
-            extracted = extract_coords_from_url(listing_url)
-            if extracted:
-                lat_input, lon_input = extracted
-                st.success(f"📍 Coördinaten gevonden in URL: {lat_input:.5f}, {lon_input:.5f}")
-            else:
-                st.warning("Kon geen automatische coördinaten in deze URL vinden.")
-                
-    elif location_method == "Plaatsnaam / Postcode":
-        town_input = st.text_input("Plaatsnaam of postcode:", value="Aynac 46120")
-        if town_input:
-            geo_coords = geocode_french_town(town_input)
-            if geo_coords:
-                lat_input, lon_input = geo_coords
-                st.success(f"📍 Centrum van {town_input}: {lat_input:.5f}, {lon_input:.5f}")
-            else:
-                st.error("Plaatsnaam niet gevonden.")
-
-    elif location_method == "Handmatig Lat/Lon":
-        lat_input = st.number_input("Latitude", value=44.784400, format="%.6f")
-        lon_input = st.number_input("Longitude", value=1.851700, format="%.6f")
