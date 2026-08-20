@@ -214,3 +214,62 @@ if start_search:
         ).add_to(m)
         
     st_folium(m, width=1000, height=600)
+import re
+from urllib.parse import unquote
+
+def extract_coords_from_url(url: str):
+    """Haalt automatisch coördinaten uit een Bien'ici of Google Maps URL."""
+    # Bien'ici camera parameter: camera=zoom_lon_lat_...
+    match_bienici = re.search(r'camera=\d+_([0-9.-]+)_([0-9.-]+)', url)
+    if match_bienici:
+        lon = float(match_bienici.group(1))
+        lat = float(match_bienici.group(2))
+        return lat, lon
+    
+    # Google Maps parameter: @lat,lon
+    match_gmaps = re.search(r'@([0-9.-]+),([0-9.-]+)', url)
+    if match_gmaps:
+        return float(match_gmaps.group(1)), float(match_gmaps.group(2))
+        
+    return None
+
+def geocode_french_town(town_name: str):
+    """Zet een Franse plaatsnaam/postcode om naar GPS-coördinaten via de overheids-API."""
+    url = f"https://api-adresse.data.gouv.fr/search/?q={town_name}&limit=1"
+    try:
+        res = requests.get(url, timeout=5).json()
+        if res.get('features'):
+            coords = res['features'][0]['geometry']['coordinates']
+            return coords[1], coords[0] # Lat, Lon
+    except Exception:
+        pass
+    return None
+    with st.sidebar:
+    st.header("2. Locatie bepalen")
+    location_method = st.radio("Kies invoermethode:", ["Link/URL plakken", "Plaatsnaam / Postcode", "Handmatig Lat/Lon"])
+    
+    lat_input, lon_input = 44.784400, 1.851700 # Standaardwaarden (Aynac)
+    
+    if location_method == "Link/URL plakken":
+        listing_url = st.text_input("Plak de advertentie URL (bijv. van Bien'ici):")
+        if listing_url:
+            extracted = extract_coords_from_url(listing_url)
+            if extracted:
+                lat_input, lon_input = extracted
+                st.success(f"📍 Coördinaten gevonden in URL: {lat_input:.5f}, {lon_input:.5f}")
+            else:
+                st.warning("Kon geen automatische coördinaten in deze URL vinden.")
+                
+    elif location_method == "Plaatsnaam / Postcode":
+        town_input = st.text_input("Plaatsnaam of postcode:", value="Aynac 46120")
+        if town_input:
+            geo_coords = geocode_french_town(town_input)
+            if geo_coords:
+                lat_input, lon_input = geo_coords
+                st.success(f"📍 Centrum van {town_input}: {lat_input:.5f}, {lon_input:.5f}")
+            else:
+                st.error("Plaatsnaam niet gevonden.")
+
+    elif location_method == "Handmatig Lat/Lon":
+        lat_input = st.number_input("Latitude", value=44.784400, format="%.6f")
+        lon_input = st.number_input("Longitude", value=1.851700, format="%.6f")
