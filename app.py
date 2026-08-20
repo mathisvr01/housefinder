@@ -13,8 +13,8 @@ from openai import OpenAI
 
 # --- 1. CONFIGURATIE & UI ---
 st.set_page_config(page_title="Franse Huizen OSINT Tool", layout="wide")
-st.title("🏡 Franse Huizen OSINT Tool (Deep Scan Modus)")
-st.markdown("Upload buitenfoto's, kies je zoekgebied op de kaart. De AI scant **elke centimeter** van de satellietbeelden om een shortlist te maken.")
+st.title("🏡 Franse Huizen OSINT Tool (Strenge Deep Scan)")
+st.markdown("Upload buitenfoto's en kies je zoekgebied. De AI filtert streng op grootte, bijgebouwen en vegetatie. Klik op resultaten voor **Street View**.")
 
 # --- INITIALISATIE SESSION STATE ---
 for key, default in [("search_lat", 44.891237), ("search_lon", 1.832689), 
@@ -31,7 +31,7 @@ except:
     client = None
     st.warning("⚠️ Geen `OPENAI_API_KEY` gevonden in Streamlit Secrets. AI-fotoanalyse staat uit.")
 
-# --- 2. HULPFUNCTIES ---
+# --- 2. HULPFUNCTIES LOCATIE ---
 def extract_coords_from_url(url: str):
     m_bienici = re.search(r'camera=\d+_([0-9.-]+)_([0-9.-]+)', url)
     if m_bienici: return float(m_bienici.group(2)), float(m_bienici.group(1))
@@ -54,18 +54,18 @@ def analyze_photos_with_gpt4o(image_bytes_list):
     if not client or not image_bytes_list: return None
     
     prompt = """
-    Jij bent een OSINT- en cartografie-expert. Genereer een 'Kavel-DNA' van de woning op de foto's.
-    Gebruik GEEN windrichtingen (Noord/Zuid). Gebruik relatieve posities (bijv. 'bomen direct achter het huis', 'oprit aan de zijkant').
+    Jij bent een meedogenloze OSINT-expert. Maak een 'Kavel-DNA' van dit huis.
+    Gebruik GEEN windrichtingen (zoals Noord/Zuid), maar relatieve posities ('naast het huis', 'achter de oprit').
     
     Maak een JSON:
     {
-      "dak": "Vorm en kleur van het dak (houd er rekening mee dat kleuren op satellietbeelden doffer kunnen zijn).",
+      "dak_en_grootte": "Vorm en kleur van het dak. Schat de relatieve grootte van de voetafdruk in (klein huisje, grote boerderij, langwerpig, etc.).",
       "kavel_context": {
-          "vegetatie": "Staan er bomen? Zo ja, staan ze dicht op het huis of in een open veld?",
-          "bijgebouwen_relatie": "Zijn er andere gebouwen zichtbaar op de foto's?",
+          "vegetatie": "Staan er bomen strak tegen het huis? Of in open veld? Waar precies?",
+          "bijgebouwen_relatie": "Zijn er bijgebouwen? ZO NEE, vermeld expliciet 'GEEN BIJGEBOUWEN' zodat we boerderijcomplexen kunnen afkeuren.",
           "oprit_en_infrastructuur": "Is er een zichtbare oprit of weg?"
       },
-      "strikte_combinatie_eis": "Wat is het meest opvallende kenmerk waar we op een satellietfoto naar moeten zoeken? (bijv. Huis met donker dak omringd door bomenrij)"
+      "strikte_combinatie_eis": "Wat is de harde eis? (bijv. Moet losstaand zijn zonder schuren, mét bomen aan de achterkant)"
     }
     """
     
@@ -108,25 +108,28 @@ def fetch_ign_satellite_tile(xtile, ytile, zoom):
     except: pass
     return None
 
-# --- 5. DEEP SCAN AI VERIFICATIE ---
+# --- 5. STRENGE DEEP SCAN AI VERIFICATIE ---
 def deep_scan_tile_with_ai(base64_tile, kavel_dna_json):
     if not client: return None
 
     prompt = f"""
-    Jij bent een OSINT satelliet-expert. Je krijgt een satelliet-tegel.
-    Scan de HELE afbeelding. Zoek naar gebouwen/kavels die redelijkerwijs passen bij dit Kavel-DNA:
+    Jij bent een keiharde OSINT satelliet-expert. Scan deze hele satelliet-tegel.
+    Kavel-DNA profiel waarnaar we zoeken:
     {json.dumps(kavel_dna_json)}
     
-    Wees soepel: Satellietbeelden zijn vaak verouderd. Focus op context (bomen, ligging t.o.v. andere gebouwen).
+    BEOORDEEL STRENG OP DE VOLGENDE FACTOREN:
+    1. GROOTTE & VORM: Komt de voetafdruk/maat van het gebouw overeen?
+    2. BIJGEBOUWEN: Als het DNA zegt 'geen bijgebouwen', KEUR DAN elk boerderijcomplex met meerdere daken AF (score: laag).
+    3. VEGETATIE: Als het DNA bomen eist rondom het huis, keur dan huizen in een kaal weiland AF.
     
-    Als je een mogelijke match vindt, schat de positie in percentages (X=links naar rechts, Y=boven naar beneden).
+    Als je een gebouw vindt dat een écht goede kandidaat is, schat de positie in percentages (X=links naar rechts, Y=boven naar beneden).
     
-    Retourneer een JSON met mogelijke matches. Bij geen resultaat, retourneer een lege lijst.
+    Retourneer een JSON:
     {{
       "matches": [
           {{
-              "score": "hoog (waarschijnlijk) of medium (close match, check waard)",
-              "redenering": "Waarom komt dit gebouw overeen?",
+              "score": "hoog (uitstekende match) of medium (redelijke twijfelgeval, sluit niets uit)",
+              "redenering": "Verklaar waarom dit klopt qua maat, bomen en bijgebouwen.",
               "x_percentage": 50,
               "y_percentage": 50
           }}
@@ -156,7 +159,7 @@ def deep_scan_tile_with_ai(base64_tile, kavel_dna_json):
                     "x_perc": match.get("x_percentage", 50),
                     "y_perc": match.get("y_percentage", 50),
                     "score": "hoog" if "hoog" in score else "medium",
-                    "type": f"Score: {score.upper()} | {match.get('redenering', '')}"
+                    "type": f"{match.get('redenering', '')}"
                 })
         return valid_matches
     except:
@@ -203,7 +206,7 @@ with st.sidebar:
         st.session_state.search_lon = st.number_input("Lon", value=st.session_state.search_lon, format="%.6f")
 
     grid_size = st.slider("Zoekbereik (aantal tegels)", min_value=1, max_value=7, value=3, step=2)
-    start_search = st.button("Start AI Deep Scan 🚀", type="primary")
+    start_search = st.button("Start Strenge AI Scan 🚀", type="primary")
 
 # --- 7. HOOFDWEERGAVE ---
 if not start_search and st.session_state.found_hits is None:
@@ -220,7 +223,7 @@ if not start_search and st.session_state.found_hits is None:
                     image_bytes_list = [f.getvalue() for f in uploaded_files]
                     st.session_state.ai_data = analyze_photos_with_gpt4o(image_bytes_list)
             if st.session_state.ai_data:
-                st.subheader("📊 Woning Blauwdruk")
+                st.subheader("📊 Strikte Woning Blauwdruk")
                 st.json(st.session_state.ai_data)
             
     if location_method == "Plaatsnaam + Kaart":
@@ -242,7 +245,7 @@ if not start_search and st.session_state.found_hits is None:
 # --- 8. SCAN UITVOEREN ---
 if start_search:
     st.divider()
-    st.subheader("🔍 Deep Scan Bezig...")
+    st.subheader("🔍 Deep Scan Bezig met OSINT-regels...")
     
     lat_target = st.session_state.search_lat
     lon_target = st.session_state.search_lon
@@ -260,7 +263,7 @@ if start_search:
     for dx in range(-offset, offset + 1):
         for dy in range(-offset, offset + 1):
             step += 1
-            status_text.text(f"Tegel {step} van {total_tiles} analyseren met AI. Even geduld...")
+            status_text.text(f"Tegel {step} van {total_tiles} streng beoordelen met AI. Even geduld...")
             progress_bar.progress(step / total_tiles)
             
             tx = center_x + dx
@@ -289,23 +292,38 @@ if start_search:
             
     status_text.text("Scan Voltooid!")
             
-# --- 9. RESULTATEN TONEN ---
+# --- 9. RESULTATEN TONEN MET GOOGLE STREET VIEW LINKS ---
 if st.session_state.found_hits is not None:
     st.divider()
     hits = st.session_state.found_hits
     if len(hits) > 0:
-        st.success(f"Deep Scan afgerond! {len(hits)} kandidaten gevonden.")
+        st.success(f"Deep Scan afgerond! {len(hits)} strenge kandidaten gevonden.")
     else:
-        st.warning("Geen kandidaten gevonden. Probeer een groter zoekgebied.")
+        st.warning("Geen kandidaten gevonden. De AI heeft elk huis afgekeurd o.b.v. vorm, bijgebouwen of vegetatie.")
 
     m_results = create_satellite_map(st.session_state.search_lat, st.session_state.search_lon, 16)
     folium.Circle(location=[st.session_state.search_lat, st.session_state.search_lon], radius=grid_size * 180, color="blue", fill=False).add_to(m_results)
     
     for hit in hits:
         color = "green" if hit["score"] == "hoog" else "orange"
+        
+        # Hyperlinks genereren voor Google Maps & Street View
+        maps_link = f"https://www.google.com/maps/search/?api=1&query={hit['lat']},{hit['lon']}"
+        streetview_link = f"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={hit['lat']},{hit['lon']}"
+        
+        # HTML Pop-up
+        popup_html = f"""
+        <div style="font-family: Arial; font-size: 14px; min-width: 220px;">
+            <b style="color: {'green' if color == 'green' else '#d97706'};">Score: {hit['score'].upper()}</b><br>
+            <p style="margin-top: 5px; margin-bottom: 12px; font-size: 12px;">{hit['type']}</p>
+            <a href="{maps_link}" target="_blank" style="display:block; margin-bottom: 5px; text-decoration: none; color: #1a73e8;">🗺️ Open in Google Maps</a>
+            <a href="{streetview_link}" target="_blank" style="display:block; text-decoration: none; color: #1a73e8;">🚗 Open in Street View</a>
+        </div>
+        """
+        
         folium.Marker(
             location=[hit["lat"], hit["lon"]],
-            popup=folium.Popup(hit['type'], max_width=300),
+            popup=folium.Popup(popup_html, max_width=300),
             icon=folium.Icon(color=color, icon="check" if color=="green" else "search", prefix="fa") 
         ).add_to(m_results)
         
