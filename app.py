@@ -13,9 +13,9 @@ from streamlit_folium import st_folium
 from openai import OpenAI
 
 # --- 1. CONFIGURATIE & UI ---
-st.set_page_config(page_title="Franse Huizen Geolocation Tool", layout="wide")
-st.title("🏡 Franse Huizen Geolocation Tool (Meerdere Foto's & AI)")
-st.markdown("Upload buitenfoto's, kies je zoekgebied op de kaart en de AI zoekt naar een exacte combinatie van factoren op satellietbeelden.")
+st.set_page_config(page_title="Franse Huizen OSINT Tool", layout="wide")
+st.title("🏡 Franse Huizen OSINT Tool (Meerdere Foto's & AI)")
+st.markdown("Upload buitenfoto's, kies je zoekgebied op de kaart en laat de AI een shortlist maken van 'close matches' op de satellietbeelden (IGN).")
 
 # --- INITIALISATIE SESSION STATE ---
 if "search_lat" not in st.session_state: st.session_state.search_lat = 44.891237
@@ -56,23 +56,22 @@ def analyze_photos_with_gpt4o(image_bytes_list):
     if not client or not image_bytes_list: return None
     
     prompt = """
-    Jij bent een strenge OSINT- en cartografie-expert. Genereer een gedetailleerd 'Kavel-DNA'.
+    Jij bent een OSINT- en cartografie-expert. Genereer een 'Kavel-DNA' van de woning op de foto's.
     
-    BELANGRIJK: Gebruik GEEN windrichtingen (Noord, Oost, Zuid, West) want die kun je niet exact weten vanaf een foto. 
-    Gebruik uitsluitend relatieve posities (bijv. 'links van de voordeur', 'achter het hoofdhuis', 'grenzend aan de oprit').
+    BELANGRIJK: Gebruik GEEN windrichtingen (Noord, Oost, Zuid, West). Gebruik uitsluitend relatieve posities (bijv. 'blinde muur direct grenzend aan bosrand', 'oprit aan de kant van de hoofdingang').
     
     Maak een JSON met de volgende velden:
     {
       "dak": {
-          "hoofdvorm": "bijv. complex L-vormig, U-vormig, eenvoudig rechthoekig, T-vormig",
+          "hoofdvorm": "bijv. complex L-vormig, eenvoudig rechthoekig, T-vormig",
           "kleur_signatuur": "bijv. donker leisteen, terracotta rode dakpannen"
       },
-      "kavel_blauwdruk": {
-          "vegetatie_relatie": "Zeer belangrijk! Staan er bomen strak tegen het huis? Is het een open veld? Beschrijf dit relatief t.o.v. de gebouwen.",
-          "bijgebouwen_relatie": "Zijn er permanente bijgebouwen dichtbij zichtbaar?",
-          "oprit_en_omgeving": "Is er een zichtbare oprit of weg direct naast het huis?"
+      "kavel_context": {
+          "vegetatie": "Beschrijf de relatieve positie en dichtheid van bomen. (bijv. 'dichte bosrand die het huis aan de achterkant omarmt' of 'gelegen in een open veld')",
+          "bijgebouwen_relatie": "Zijn er permanente bijgebouwen zichtbaar en in welke relatieve positie?",
+          "oprit_en_infrastructuur": "Is er een zichtbare oprit of weg direct naast het huis?"
       },
-      "must_haves_voor_match": "Geef een lijstje van 3 harde eisen waar de satelliet-locatie aan MOET voldoen (bijv. 'Moet bomen direct tegen de achterkant hebben EN een L-vormig dak')."
+      "strikte_combinatie_eis": "Geef in 1 zin de belangrijkste combinatie van factoren voor een match (bijv. 'Moet bomen direct tegen de gevel hebben EN een rechthoekig dak')."
     }
     """
     
@@ -115,7 +114,7 @@ def fetch_ign_satellite_tile(xtile, ytile, zoom):
     except: pass
     return None
 
-# --- 5. KEIHARDE AI VERIFICATIE ---
+# --- 5. AI VERIFICATIE (SHORTLIST MODUS) ---
 def verify_daken_with_ai(base64_tile, daken_coords_list, kavel_dna_json):
     if not client: return None
 
@@ -124,23 +123,22 @@ def verify_daken_with_ai(base64_tile, daken_coords_list, kavel_dna_json):
 
     prompt = f"""
     Je ziet een satelliet-tegel met gemarkeerde potentiële daken (pixel-coördinaten [x,y,w,h]).
-    Daken lijst: {daken_prompt}
+    Vergelijk deze locaties met het Kavel-DNA: {kavel_dna_prompt}
     
-    Jij bent de eind-keurmeester. Je MOET een dak AFKEUREN als het niet aan de COMBINATIE van factoren uit het Kavel-DNA voldoet.
-    Kavel-DNA: {kavel_dna_prompt}
+    Jouw doel is om een SHORTLIST te maken van goede kandidaten. Omdat satellietbeelden verouderd kunnen zijn, staan we 'close matches' toe.
     
-    REGELS:
-    1. Een overeenkomende dakkleur is ONVOLDOENDE.
-    2. Kijk kritisch naar de 'vegetatie_relatie' en 'must_haves_voor_match'. Als de Kavel-DNA zegt dat er bomen vlakbij staan, en dit dak ligt in een open veld, dan is het GEEN match.
-    3. Liever 0 matches dan onbetrouwbare matches. Geef alleen 'hoog' als vorm, kleur, bomen en omgeving allemaal redelijkerwijs kloppen op het satellietbeeld.
+    Geef elk dak een score:
+    - "hoog": Exacte match. Dakvorm, vegetatie en bijgebouwen komen perfect overeen.
+    - "medium": Close match. Het lijkt er sterk op, maar kleine details (zoals de exacte bomenlijn of schaduw) wijken iets af. Zeer aannemelijke kandidaat.
+    - "laag": Overduidelijk fout. (Bijv. gebouw ligt in een kaal veld terwijl we een bos zoeken).
     
     Retourneer:
     {{
       "verified_daken": [
           {{
               "dak_id": 0,
-              "match_waarschijnlijkheid": "laag of hoog",
-              "redenering": "Waarom wel of niet? Benoem expliciet de vegetatie en vorm.",
+              "score": "hoog, medium of laag",
+              "redenering": "Waarom deze score? Benoem de context.",
               "x_center": 123, "y_center": 456
           }}
       ]
@@ -163,19 +161,21 @@ def verify_daken_with_ai(base64_tile, daken_coords_list, kavel_dna_json):
         
         verified_results = []
         for verified_dak in result_json.get("verified_daken", []):
-            if verified_dak.get("match_waarschijnlijkheid") == "hoog":
+            score = verified_dak.get("score", "laag").lower()
+            if score in ["hoog", "medium"]:  # Accepteer nu zowel perfecte als close matches!
                 verified_results.append({
                     "x_tile": verified_dak["x_center"],
                     "y_tile": verified_dak["y_center"],
-                    "type": f"Exacte Match: {verified_dak['redenering']}"
+                    "score": score,
+                    "type": f"Score: {score.upper()} | {verified_dak['redenering']}"
                 })
         return verified_results
     except Exception as e:
         return None
 
-# --- MAP HULPFUNCTIE MET SATELLIET ---
+# --- MAP HULPFUNCTIES ---
 def create_satellite_map(lat, lon, zoom):
-    """Maakt een Folium map met Franse IGN satellietbeelden als basislaag."""
+    """Maakt een Folium map met Franse IGN satellietbeelden (voor de resultaten)."""
     m = folium.Map(location=[lat, lon], zoom_start=zoom, tiles=None)
     folium.TileLayer(
         tiles='https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&STYLE=normal&FORMAT=image/jpeg&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}',
@@ -218,7 +218,7 @@ with st.sidebar:
         st.session_state.search_lon = st.number_input("Lon", value=st.session_state.search_lon, format="%.6f")
 
     grid_size = st.slider("Zoekbereik rondom de pin (aantal tegels)", min_value=1, max_value=7, value=3, step=2)
-    start_search = st.button("Start Strenge AI Zoekopdracht 🚀", type="primary")
+    start_search = st.button("Start Zoektocht (Shortlist) 🚀", type="primary")
 
 # --- 7. HOOFDWEERGAVE (VOOR HET ZOEKEN) ---
 if not start_search and st.session_state.found_hits is None:
@@ -232,20 +232,20 @@ if not start_search and st.session_state.found_hits is None:
         st.divider()
         
         if client:
-            with st.spinner("🤖 GPT-4o berekent strikt Kavel-DNA..."):
+            with st.spinner("🤖 GPT-4o analyseert het Kavel-DNA..."):
                 image_bytes_list = [f.getvalue() for f in uploaded_files]
                 if st.session_state.ai_data is None:
                     st.session_state.ai_data = analyze_photos_with_gpt4o(image_bytes_list)
                 
             if st.session_state.ai_data:
-                st.subheader("📊 Strikte Woning Blauwdruk")
+                st.subheader("📊 Woning Blauwdruk")
                 st.json(st.session_state.ai_data)
             
     if location_method == "Plaatsnaam + Kaart":
         st.divider()
         st.subheader("📍 Klik op de kaart om je exacte zoek-pin te plaatsen")
         
-        # We gebruiken hier weer de standaard OpenStreetMap voor de selectie!
+        # Standaard OpenStreetMap voor makkelijk navigeren en selecteren
         m_select = folium.Map(location=st.session_state.map_center, zoom_start=13)
         folium.Circle(location=[st.session_state.search_lat, st.session_state.search_lon], radius=grid_size * 180, color="red", fill=True, fill_opacity=0.3).add_to(m_select)
         folium.Marker(location=[st.session_state.search_lat, st.session_state.search_lon], icon=folium.Icon(color="red", icon="crosshairs", prefix="fa"), tooltip="Zoekmiddelpunt").add_to(m_select)
@@ -262,7 +262,7 @@ if not start_search and st.session_state.found_hits is None:
 # --- 8. UITVOEREN VAN DE SCAN ---
 if start_search:
     st.divider()
-    st.subheader("🔍 IGN Satellietbeelden scannen (Strenge Modus)...")
+    st.subheader("🔍 IGN Satellietbeelden scannen (Shortlist Modus)...")
     
     lat_target = st.session_state.search_lat
     lon_target = st.session_state.search_lon
@@ -287,11 +287,11 @@ if start_search:
                 hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
                 potentiële_daken = []
 
-                # Zoek alle gebouwen (breder spectrum: rode en donkere daken)
+                # Brede filter: alle bebouwing ophalen
                 mask1 = cv2.inRange(hsv, np.array([0, 50, 20]), np.array([20, 255, 255]))
                 mask2 = cv2.inRange(hsv, np.array([160, 50, 20]), np.array([180, 255, 255]))
                 gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-                _, mask3 = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV) # Donkere leisteen daken
+                _, mask3 = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV)
                 
                 contours, _ = cv2.findContours(mask1 | mask2 | mask3, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
                 
@@ -315,7 +315,8 @@ if start_search:
                             hit_lat = nw_lat + (res["y_tile"] / 256.0) * (se_lat - nw_lat)
                             st.session_state.found_hits.append({
                                 "lat": hit_lat, "lon": hit_lon, 
-                                "type": res["type"]
+                                "type": res["type"],
+                                "score": res["score"]
                             })
             
             step += 1
@@ -324,20 +325,26 @@ if start_search:
 # --- 9. RESULTATEN WEERGAVE (MET SATELLIETKAART) ---
 if st.session_state.found_hits is not None:
     st.divider()
-    if len(st.session_state.found_hits) > 0:
-        st.success(f"Scan voltooid! {len(st.session_state.found_hits)} harde match(es) gevonden die aan alle voorwaarden voldoen.")
+    
+    hits = st.session_state.found_hits
+    if len(hits) > 0:
+        st.success(f"Scan voltooid! Er staan {len(hits)} kandidaten op je shortlist.")
     else:
-        st.warning("Scan voltooid. 0 matches gevonden. De AI heeft alle daken afgekeurd omdat de combinatie (bijv. vegetatie of vorm) niet overeenkwam met de foto's.")
+        st.warning("Scan voltooid. Zelfs in de tolerante modus vond de AI geen enkel gebouw in dit gebied dat op de kavel van de foto's lijkt.")
 
-    # Hier gebruiken we de satellietkaart voor de resultaten!
+    # Resultaten op de IGN Satellietkaart
     m_results = create_satellite_map(st.session_state.search_lat, st.session_state.search_lon, 16)
     folium.Circle(location=[st.session_state.search_lat, st.session_state.search_lon], radius=grid_size * 180, color="blue", fill=False).add_to(m_results)
     
-    for hit in st.session_state.found_hits:
+    for hit in hits:
+        # Kleur bepalen obv de score
+        marker_color = "green" if hit["score"] == "hoog" else "orange"
+        marker_icon = "check" if hit["score"] == "hoog" else "search"
+        
         folium.Marker(
             location=[hit["lat"], hit["lon"]],
-            popup=f"Match: {hit['type']}",
-            icon=folium.Icon(color="green", icon="check", prefix="fa") 
+            popup=folium.Popup(hit['type'], max_width=300),
+            icon=folium.Icon(color=marker_color, icon=marker_icon, prefix="fa") 
         ).add_to(m_results)
         
     st_folium(m_results, width=1000, height=600)
