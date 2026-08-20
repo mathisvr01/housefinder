@@ -5,3 +5,4 @@ numpy
 Pillow
 folium
 streamlit-folium
+openai
