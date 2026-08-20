@@ -15,7 +15,7 @@ from openai import OpenAI
 # --- 1. CONFIGURATIE & UI ---
 st.set_page_config(page_title="Franse Huizen Geolocation Tool", layout="wide")
 st.title("🏡 Franse Huizen Geolocation Tool (Meerdere Foto's & AI)")
-st.markdown("Upload buitenfoto's, kies je zoekgebied op de **satellietkaart** en de AI zoekt naar een exacte combinatie van factoren.")
+st.markdown("Upload buitenfoto's, kies je zoekgebied op de kaart en de AI zoekt naar een exacte combinatie van factoren op satellietbeelden.")
 
 # --- INITIALISATIE SESSION STATE ---
 if "search_lat" not in st.session_state: st.session_state.search_lat = 44.891237
@@ -58,6 +58,9 @@ def analyze_photos_with_gpt4o(image_bytes_list):
     prompt = """
     Jij bent een strenge OSINT- en cartografie-expert. Genereer een gedetailleerd 'Kavel-DNA'.
     
+    BELANGRIJK: Gebruik GEEN windrichtingen (Noord, Oost, Zuid, West) want die kun je niet exact weten vanaf een foto. 
+    Gebruik uitsluitend relatieve posities (bijv. 'links van de voordeur', 'achter het hoofdhuis', 'grenzend aan de oprit').
+    
     Maak een JSON met de volgende velden:
     {
       "dak": {
@@ -65,11 +68,11 @@ def analyze_photos_with_gpt4o(image_bytes_list):
           "kleur_signatuur": "bijv. donker leisteen, terracotta rode dakpannen"
       },
       "kavel_blauwdruk": {
-          "vegetatie_relatie": "Zeer belangrijk! Staan er bomen strak tegen het huis? Is het een open veld? Waar staan de bomen t.o.v. het gebouw?",
+          "vegetatie_relatie": "Zeer belangrijk! Staan er bomen strak tegen het huis? Is het een open veld? Beschrijf dit relatief t.o.v. de gebouwen.",
           "bijgebouwen_relatie": "Zijn er permanente bijgebouwen dichtbij zichtbaar?",
           "oprit_en_omgeving": "Is er een zichtbare oprit of weg direct naast het huis?"
       },
-      "must_haves_voor_match": "Geef een lijstje van 3 harde eisen waar de satelliet-locatie aan MOET voldoen (bijv. 'Moet bomen aan de westkant hebben EN een rechthoekig dak')."
+      "must_haves_voor_match": "Geef een lijstje van 3 harde eisen waar de satelliet-locatie aan MOET voldoen (bijv. 'Moet bomen direct tegen de achterkant hebben EN een L-vormig dak')."
     }
     """
     
@@ -129,7 +132,7 @@ def verify_daken_with_ai(base64_tile, daken_coords_list, kavel_dna_json):
     REGELS:
     1. Een overeenkomende dakkleur is ONVOLDOENDE.
     2. Kijk kritisch naar de 'vegetatie_relatie' en 'must_haves_voor_match'. Als de Kavel-DNA zegt dat er bomen vlakbij staan, en dit dak ligt in een open veld, dan is het GEEN match.
-    3. Liever 0 matches dan onbetrouwbare matches. Geef alleen 'hoog' als vorm, kleur, bomen en omgeving allemaal kloppen.
+    3. Liever 0 matches dan onbetrouwbare matches. Geef alleen 'hoog' als vorm, kleur, bomen en omgeving allemaal redelijkerwijs kloppen op het satellietbeeld.
     
     Retourneer:
     {{
@@ -240,9 +243,10 @@ if not start_search and st.session_state.found_hits is None:
             
     if location_method == "Plaatsnaam + Kaart":
         st.divider()
-        st.subheader("📍 Klik op de satellietkaart om je exacte zoek-pin te plaatsen")
+        st.subheader("📍 Klik op de kaart om je exacte zoek-pin te plaatsen")
         
-        m_select = create_satellite_map(st.session_state.map_center[0], st.session_state.map_center[1], 14)
+        # We gebruiken hier weer de standaard OpenStreetMap voor de selectie!
+        m_select = folium.Map(location=st.session_state.map_center, zoom_start=13)
         folium.Circle(location=[st.session_state.search_lat, st.session_state.search_lon], radius=grid_size * 180, color="red", fill=True, fill_opacity=0.3).add_to(m_select)
         folium.Marker(location=[st.session_state.search_lat, st.session_state.search_lon], icon=folium.Icon(color="red", icon="crosshairs", prefix="fa"), tooltip="Zoekmiddelpunt").add_to(m_select)
         map_data = st_folium(m_select, width=1000, height=450, key="selection_map")
@@ -325,6 +329,7 @@ if st.session_state.found_hits is not None:
     else:
         st.warning("Scan voltooid. 0 matches gevonden. De AI heeft alle daken afgekeurd omdat de combinatie (bijv. vegetatie of vorm) niet overeenkwam met de foto's.")
 
+    # Hier gebruiken we de satellietkaart voor de resultaten!
     m_results = create_satellite_map(st.session_state.search_lat, st.session_state.search_lon, 16)
     folium.Circle(location=[st.session_state.search_lat, st.session_state.search_lon], radius=grid_size * 180, color="blue", fill=False).add_to(m_results)
     
