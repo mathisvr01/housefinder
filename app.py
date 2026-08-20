@@ -17,15 +17,13 @@ st.set_page_config(page_title="Franse Huizen Zoeker AI", layout="wide")
 st.title("🏡 Franse Huizen Geolocation Tool (Meerdere Foto's & AI)")
 st.markdown("Upload meerdere buitenfoto's, kies je zoekgebied op de interactieve kaart en laat de AI scannen.")
 
-# Initialize Session State voor coördinaten (om map-clicks te onthouden)
-if "search_lat" not in st.session_state:
-    st.session_state.search_lat = 44.891237
-if "search_lon" not in st.session_state:
-    st.session_state.search_lon = 1.832689
-if "map_center" not in st.session_state:
-    st.session_state.map_center = [44.891237, 1.832689]
-if "last_town" not in st.session_state:
-    st.session_state.last_town = ""
+# Initialize Session State
+if "search_lat" not in st.session_state: st.session_state.search_lat = 44.891237
+if "search_lon" not in st.session_state: st.session_state.search_lon = 1.832689
+if "map_center" not in st.session_state: st.session_state.map_center = [44.891237, 1.832689]
+if "last_town" not in st.session_state: st.session_state.last_town = ""
+if "ai_data" not in st.session_state: st.session_state.ai_data = None
+if "found_hits" not in st.session_state: st.session_state.found_hits = None
 
 # OpenAI Client setup
 api_key = st.secrets.get("OPENAI_API_KEY", None)
@@ -38,12 +36,9 @@ else:
 # --- 2. HULPFUNCTIES VOOR LOCATIE EN URL ---
 def extract_coords_from_url(url: str):
     match_bienici = re.search(r'camera=\d+_([0-9.-]+)_([0-9.-]+)', url)
-    if match_bienici:
-        return float(match_bienici.group(2)), float(match_bienici.group(1))
-    
+    if match_bienici: return float(match_bienici.group(2)), float(match_bienici.group(1))
     match_gmaps = re.search(r'@([0-9.-]+),([0-9.-]+)', url)
-    if match_gmaps:
-        return float(match_gmaps.group(1)), float(match_gmaps.group(2))
+    if match_gmaps: return float(match_gmaps.group(1)), float(match_gmaps.group(2))
     return None
 
 def geocode_french_town(town_name: str):
@@ -52,48 +47,46 @@ def geocode_french_town(town_name: str):
         res = requests.get(url, timeout=5).json()
         if res.get('features'):
             coords = res['features'][0]['geometry']['coordinates']
-            return coords[1], coords[0] # Lat, Lon
-    except Exception:
-        pass
+            return coords[1], coords[0]
+    except Exception: pass
     return None
 
-# --- 3. AI FOTO-ANALYSE FUNCTIE (MEERDERE FOTO'S) ---
+# --- 3. AI FOTO-ANALYSE FUNCTIE ---
 def analyze_photos_with_gpt4o(image_bytes_list):
     if not client or not image_bytes_list: return None
     
     prompt = """
-    Analyseer deze verzameling buitenfoto's van een woning in Frankrijk voor satelliet-geolocatie matching.
-    Kijk naar de combinatie van foto's om een compleet beeld te vormen.
+    Jij bent een OSINT (Open Source Intelligence) expert, gespecialiseerd in het geoloceren van gebouwen op satellietbeelden.
+    Analyseer deze foto's en zoek naar harde, permanente kenmerken die zichtbaar zijn vanuit de ruimte.
     
-    Belangrijke regels:
-    1. Negeer tijdelijke opzetzwembaden. Zet 'heeft_zwembad' ALLEEN op true als het een permanent, ingegraven zwembad is.
-    2. Bepaal de dak_kleur op basis van de duidelijkste foto(s).
-    
-    Geef ALLEEN een geldig JSON object terug met de volgende velden (in het Nederlands):
+    Geef ALLEEN een JSON object terug. Baseer je antwoord strikt op wat je ziet.
     {
-      "dak_kleur": "bijv. rood/oranje dakpannen, donkere leisteen, plat dak, grijs",
-      "heeft_zwembad": true/false,
-      "bijzonderheden": "Korte samenvatting (max 2 zinnen) van permanente ankerpunten zoals een opvallende oprit, bijgebouwen, of ligging op een helling."
+      "dak_kenmerken": {
+          "kleur": "bijv. donkerrode dakpannen, leisteen, plat dak",
+          "vorm": "bijv. rechthoekig, L-vormig, complexe aanbouw",
+          "opvallende_elementen": "bijv. opvallende dakkapellen, grote schoorsteen (optioneel)"
+      },
+      "heeft_permanent_zwembad": true/false, // Zet op FALSE als het een opblaas- of opzetzwembad is!
+      "omgeving_en_infrastructuur": {
+          "verharding": "Zijn er zichtbare opritten, betonplaten of terrassen?",
+          "vegetatie_patronen": "Ligt het huis direct tegen een dichte bosrand aan, of midden in een open veld?",
+          "schaduw_en_helling": "Is het terrein overduidelijk geaccidenteerd/hellend?"
+      },
+      "osint_zoekadvies": "Geef in 2 korte zinnen gericht advies waar de satelliet-zoeker op moet letten bij het handmatig scannen van de kaart."
     }
     """
     
-    # Maak de payload op: begin met de tekstprompt
     messages_content = [{"type": "text", "text": prompt}]
-    
-    # Voeg alle foto's toe aan de API aanroep
     for img_bytes in image_bytes_list:
         base64_image = base64.b64encode(img_bytes).decode('utf-8')
-        messages_content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
-        })
+        messages_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}})
         
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": messages_content}],
             response_format={"type": "json_object"},
-            max_tokens=300
+            max_tokens=500
         )
         return json.loads(response.choices[0].message.content)
     except Exception as e:
@@ -127,7 +120,7 @@ def scan_tile_features(pil_image, ai_analysis):
     hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
     matches = []
 
-    if ai_analysis and ai_analysis.get("heeft_zwembad"):
+    if ai_analysis and ai_analysis.get("heeft_permanent_zwembad"):
         mask = cv2.inRange(hsv, np.array([80, 50, 50]), np.array([130, 255, 255]))
         contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
@@ -135,21 +128,21 @@ def scan_tile_features(pil_image, ai_analysis):
                 x, y, w, h = cv2.boundingRect(cnt)
                 matches.append({"x": x + w/2, "y": y + h/2, "type": "Zwembad Match"})
 
-    dak_kleur = str(ai_analysis.get("dak_kleur", "")).lower() if ai_analysis else ""
-    if "rood" in dak_kleur or "oranje" in dak_kleur or "pan" in dak_kleur:
-        mask1 = cv2.inRange(hsv, np.array([0, 70, 50]), np.array([10, 255, 255]))
-        mask2 = cv2.inRange(hsv, np.array([170, 70, 50]), np.array([180, 255, 255]))
-        contours, _ = cv2.findContours(mask1 | mask2, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            if 100 < cv2.contourArea(cnt) < 2000:
-                x, y, w, h = cv2.boundingRect(cnt)
-                matches.append({"x": x + w/2, "y": y + h/2, "type": "Dak Match"})
+    if ai_analysis:
+        dak_kleur = str(ai_analysis.get("dak_kenmerken", {}).get("kleur", "")).lower()
+        if "rood" in dak_kleur or "oranje" in dak_kleur or "pan" in dak_kleur:
+            mask1 = cv2.inRange(hsv, np.array([0, 70, 50]), np.array([10, 255, 255]))
+            mask2 = cv2.inRange(hsv, np.array([170, 70, 50]), np.array([180, 255, 255]))
+            contours, _ = cv2.findContours(mask1 | mask2, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                if 100 < cv2.contourArea(cnt) < 2000:
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    matches.append({"x": x + w/2, "y": y + h/2, "type": "Dak Match"})
     return matches
 
 # --- 5. SIDEBAR ---
 with st.sidebar:
     st.header("1. Woningfoto's")
-    # TWEAK: accept_multiple_files=True toegevoegd
     uploaded_files = st.file_uploader("Upload makelaarsfoto's", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
     
     st.header("2. Locatie Bepalen")
@@ -181,65 +174,48 @@ with st.sidebar:
     grid_size = st.slider("Zoekbereik rondom de pin", min_value=1, max_value=7, value=3, step=2)
     start_search = st.button("Start AI Analyse & Zoekopdracht 🚀", type="primary")
 
-# --- 6. HOOFDWEERGAVE (Voor het zoeken) ---
-ai_data = None
+# --- 6. HOOFDWEERGAVE ---
 
-if not start_search:
-    # 6A. Laat de foto's en AI-kenmerken zien
+# 6A. Als we nog niet gezocht hebben, of we de resultaten willen resetten
+if not start_search and st.session_state.found_hits is None:
     if uploaded_files:
         st.subheader(f"{len(uploaded_files)} foto('s) geüpload")
-        
-        # Laat foto's mooi naast elkaar zien (max 3 op een rij)
         cols = st.columns(min(len(uploaded_files), 3))
         for i, photo in enumerate(uploaded_files):
             with cols[i % 3]:
-                st.image(photo, caption=f"Foto {i+1}", use_container_width=True)
+                st.image(photo, caption=f"Foto {i+1}", width='stretch')
         
         st.divider()
         
-        # AI Analyse
         if client:
-            with st.spinner(f"🤖 GPT-4o analyseert {len(uploaded_files)} foto('s)..."):
-                # Zet bestanden om naar een lijst van bytes
+            with st.spinner("🤖 GPT-4o OSINT analyseert foto('s)..."):
                 image_bytes_list = [f.getvalue() for f in uploaded_files]
-                ai_data = analyze_photos_with_gpt4o(image_bytes_list)
+                # Sla de analyse op in de session state, tenzij deze al is gedaan voor deze sessie
+                if st.session_state.ai_data is None:
+                    st.session_state.ai_data = analyze_photos_with_gpt4o(image_bytes_list)
                 
-            if ai_data:
-                st.subheader("📊 AI Conclusie")
-                st.json(ai_data)
+            if st.session_state.ai_data:
+                st.subheader("📊 OSINT Geolocatie Profiel")
+                st.json(st.session_state.ai_data)
                 st.success("Analyse voltooid! Klaar voor de kaart-scan.")
             
-    # 6B. Laat de interactieve klik-kaart zien
     if location_method == "Plaatsnaam + Kaart":
         st.divider()
         st.subheader("📍 Klik op de kaart om je zoek-pin te plaatsen")
-        
         m_select = folium.Map(location=st.session_state.map_center, zoom_start=13)
-        
-        folium.Circle(
-            location=[st.session_state.search_lat, st.session_state.search_lon],
-            radius=grid_size * 180,
-            color="red", fill=True, fill_opacity=0.1
-        ).add_to(m_select)
-        
-        folium.Marker(
-            location=[st.session_state.search_lat, st.session_state.search_lon],
-            icon=folium.Icon(color="red", icon="crosshairs", prefix="fa"),
-            tooltip="Huidig zoekgebied"
-        ).add_to(m_select)
-        
+        folium.Circle(location=[st.session_state.search_lat, st.session_state.search_lon], radius=grid_size * 180, color="red", fill=True, fill_opacity=0.1).add_to(m_select)
+        folium.Marker(location=[st.session_state.search_lat, st.session_state.search_lon], icon=folium.Icon(color="red", icon="crosshairs", prefix="fa"), tooltip="Huidig zoekgebied").add_to(m_select)
         map_data = st_folium(m_select, width=1000, height=450, key="selection_map")
         
         if map_data and map_data.get("last_clicked"):
             click_lat = map_data["last_clicked"]["lat"]
             click_lon = map_data["last_clicked"]["lng"]
-            
             if click_lat != st.session_state.search_lat or click_lon != st.session_state.search_lon:
                 st.session_state.search_lat = click_lat
                 st.session_state.search_lon = click_lon
                 st.rerun()
 
-# --- 7. START DE SATELLIET SCAN ---
+# --- 7. UITVOEREN VAN DE SCAN (Of resultaten tonen als ze in session state staan) ---
 if start_search:
     st.divider()
     st.subheader("🔍 IGN Satellietbeelden scannen...")
@@ -256,9 +232,8 @@ if start_search:
     total_tiles = grid_size * grid_size
     step = 0
     
-    if uploaded_files and client:
-        image_bytes_list = [f.getvalue() for f in uploaded_files]
-        ai_data = analyze_photos_with_gpt4o(image_bytes_list)
+    # Gebruik de data uit de session state
+    ai_data = st.session_state.ai_data
 
     for dx in range(-offset, offset + 1):
         for dy in range(-offset, offset + 1):
@@ -279,12 +254,16 @@ if start_search:
             step += 1
             progress.progress(step / total_tiles)
             
-    st.success(f"Scan voltooid! {len(found_hits)} potentiële locaties gevonden in het raster.")
+    # Sla de resultaten op in session state
+    st.session_state.found_hits = found_hits
     
-    m_results = folium.Map(location=[lat_target, lon_target], zoom_start=15)
-    folium.Circle(location=[lat_target, lon_target], radius=grid_size * 180, color="blue", fill=True, fill_opacity=0.1).add_to(m_results)
+# Toon de resultaten als ze aanwezig zijn
+if st.session_state.found_hits is not None:
+    st.success(f"Scan voltooid! {len(st.session_state.found_hits)} potentiële locaties gevonden in het raster.")
+    m_results = folium.Map(location=[st.session_state.search_lat, st.session_state.search_lon], zoom_start=15)
+    folium.Circle(location=[st.session_state.search_lat, st.session_state.search_lon], radius=grid_size * 180, color="blue", fill=True, fill_opacity=0.1).add_to(m_results)
     
-    for hit in found_hits:
+    for hit in st.session_state.found_hits:
         folium.Marker(
             location=[hit["lat"], hit["lon"]],
             popup=f"Match: {hit['type']}",
@@ -293,5 +272,6 @@ if start_search:
         
     st_folium(m_results, width=1000, height=600)
     
-    if st.button("⬅️ Terug naar aanpassen"):
+    if st.button("⬅️ Terug naar aanpassen (Reset Scan)"):
+        st.session_state.found_hits = None
         st.rerun()
