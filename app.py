@@ -1,334 +1,544 @@
-import streamlit as st
-import requests
-import numpy as np
-from PIL import Image
-import io
-import math
-import base64
-import json
-import re
+from __future__ import annotations
+
+import hashlib
+import html
+import os
+from dataclasses import replace
+from pathlib import Path
+
 import folium
+import streamlit as st
 from streamlit_folium import st_folium
-from openai import OpenAI
 
-# --- 1. CONFIGURATIE & UI ---
-st.set_page_config(page_title="Franse Huizen OSINT Tool", layout="wide")
-st.title("🏡 Franse Huizen OSINT Tool (Strenge Deep Scan)")
-st.markdown("Upload buitenfoto's en kies je zoekgebied. De AI filtert streng op grootte, bijgebouwen en vegetatie. Klik op resultaten voor **Street View**.")
+from housefinder.ai import AIServiceError, OpenAIVisionService, prepare_photos
+from housefinder.config import DEFAULT_SETTINGS
+from housefinder.costs import BudgetExceeded, CostLedger
+from housefinder.geo import extract_coords_from_url
+from housefinder.ign import IGNClient, IGNError
+from housefinder.imagery import IGNImageryClient
+from housefinder.models import ListingProfile, SearchResult
+from housefinder.pipeline import run_search
 
-# --- INITIALISATIE SESSION STATE ---
-for key, default in [("search_lat", 44.891237), ("search_lon", 1.832689), 
-                     ("map_center", [44.891237, 1.832689]), ("last_town", ""), 
-                     ("ai_data", None), ("found_hits", None)]:
-    if key not in st.session_state:
-        st.session_state[key] = default
+PROJECT_DIR = Path(__file__).resolve().parent
+SETTINGS = replace(
+    DEFAULT_SETTINGS,
+    cache_dir=Path(os.getenv("HOUSEFINDER_CACHE_DIR", PROJECT_DIR / ".cache" / "housefinder")),
+)
 
-# --- OpenAI Client setup ---
-try:
-    api_key = st.secrets["OPENAI_API_KEY"]
-    client = OpenAI(api_key=api_key)
-except:
-    client = None
-    st.warning("⚠️ Geen `OPENAI_API_KEY` gevonden in Streamlit Secrets. AI-fotoanalyse staat uit.")
+SIZE_OPTIONS = ["unknown", "small", "medium", "large"]
+SHAPE_OPTIONS = ["unknown", "compact", "elongated", "complex", "l_shape", "u_shape", "courtyard"]
+SETTING_OPTIONS = ["unknown", "isolated", "small_cluster", "village"]
+VEGETATION_OPTIONS = ["unknown", "open", "mixed", "wooded"]
+ROAD_OPTIONS = ["unknown", "roadside", "short_drive", "long_drive"]
+TERNARY_OPTIONS = ["unknown", "yes", "no"]
 
-# --- 2. HULPFUNCTIES LOCATIE ---
-def extract_coords_from_url(url: str):
-    m_bienici = re.search(r'camera=\d+_([0-9.-]+)_([0-9.-]+)', url)
-    if m_bienici: return float(m_bienici.group(2)), float(m_bienici.group(1))
-    m_gmaps = re.search(r'@([0-9.-]+),([0-9.-]+)', url)
-    if m_gmaps: return float(m_gmaps.group(1)), float(m_gmaps.group(2))
-    return None
+LABELS = {
+    "unknown": "Onbekend",
+    "small": "Klein",
+    "medium": "Middelgroot",
+    "large": "Groot",
+    "compact": "Compact/rechthoekig",
+    "elongated": "Langwerpig",
+    "complex": "Complex samengesteld",
+    "l_shape": "L-vorm",
+    "u_shape": "U-vorm",
+    "courtyard": "Binnenplaats",
+    "isolated": "Vrijstaand/geïsoleerd",
+    "small_cluster": "Klein bebouwingscluster",
+    "village": "Dorp/dichte bebouwing",
+    "open": "Open terrein",
+    "mixed": "Gemengde begroeiing",
+    "wooded": "Bosrijk",
+    "roadside": "Direct aan de weg",
+    "short_drive": "Korte oprit",
+    "long_drive": "Lange oprit",
+    "yes": "Ja",
+    "no": "Nee",
+}
 
-def geocode_french_town(town_name: str):
-    url = f"https://api-adresse.data.gouv.fr/search/?q={town_name}&limit=1"
+
+st.set_page_config(page_title="HouseFinder v2", page_icon="🏡", layout="wide")
+
+
+@st.cache_resource
+def get_data_clients(cache_dir: str) -> tuple[IGNClient, IGNImageryClient]:
+    settings = replace(SETTINGS, cache_dir=Path(cache_dir))
+    return IGNClient(settings), IGNImageryClient(settings)
+
+
+def get_api_key() -> str | None:
     try:
-        res = requests.get(url, timeout=5).json()
-        if res.get('features'):
-            coords = res['features'][0]['geometry']['coordinates']
-            return coords[1], coords[0]
-    except: pass
-    return None
+        key = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        key = None
+    return str(key or os.getenv("OPENAI_API_KEY") or "").strip() or None
 
-# --- 3. AI FOTO-ANALYSE FUNCTIE ---
-def analyze_photos_with_gpt4o(image_bytes_list):
-    if not client or not image_bytes_list: return None
-    
-    prompt = """
-    Jij bent een meedogenloze OSINT-expert. Maak een 'Kavel-DNA' van dit huis.
-    Gebruik GEEN windrichtingen (zoals Noord/Zuid), maar relatieve posities ('naast het huis', 'achter de oprit').
-    
-    Maak een JSON:
-    {
-      "dak_en_grootte": "Vorm en kleur van het dak. Schat de relatieve grootte van de voetafdruk in (klein huisje, grote boerderij, langwerpig, etc.).",
-      "kavel_context": {
-          "vegetatie": "Staan er bomen strak tegen het huis? Of in open veld? Waar precies?",
-          "bijgebouwen_relatie": "Zijn er bijgebouwen? ZO NEE, vermeld expliciet 'GEEN BIJGEBOUWEN' zodat we boerderijcomplexen kunnen afkeuren.",
-          "oprit_en_infrastructuur": "Is er een zichtbare oprit of weg?"
-      },
-      "strikte_combinatie_eis": "Wat is de harde eis? (bijv. Moet losstaand zijn zonder schuren, mét bomen aan de achterkant)"
+
+def file_signature(files) -> str:
+    digest = hashlib.sha256()
+    for uploaded in files or []:
+        digest.update(uploaded.name.encode("utf-8", errors="ignore"))
+        digest.update(uploaded.getvalue())
+    return digest.hexdigest()
+
+
+def selection_signature(lat: float, lon: float, radius: float, photo_signature: str) -> str:
+    return f"{lat:.7f}|{lon:.7f}|{radius:.1f}|{photo_signature}"
+
+
+def initialize_state() -> None:
+    defaults = {
+        "search_lat": 44.891237,
+        "search_lon": 1.832689,
+        "profile": ListingProfile.unknown().model_dump(),
+        "profile_revision": 0,
+        "photo_signature": "",
+        "ledger": None,
+        "search_result": None,
+        "result_signature": None,
     }
-    """
-    
-    messages = [{"type": "text", "text": prompt}]
-    for img_bytes in image_bytes_list:
-        base64_image = base64.b64encode(img_bytes).decode('utf-8')
-        messages.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}})
-        
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": messages}],
-            response_format={"type": "json_object"},
-            max_tokens=500
-        )
-        return json.loads(response.choices[0].message.content)
-    except Exception as e:
-        st.error(f"Fout bij AI analyse: {e}")
-        return None
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
 
-# --- 4. SATELLIET TEGELS OPHALEN ---
-def deg2num(lat_deg, lon_deg, zoom):
-    lat_rad = math.radians(lat_deg)
-    n = 2.0 ** zoom
-    xtile = int((lon_deg + 180.0) / 360.0 * n)
-    ytile = int((1.0 - math.log(math.tan(lat_rad) + (1 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
-    return (xtile, ytile)
 
-def num2deg(xtile, ytile, zoom):
-    n = 2.0 ** zoom
-    lon_deg = xtile / n * 360.0 - 180.0
-    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * ytile / n)))
-    return (math.degrees(lat_rad), lon_deg)
+def translated_selectbox(label: str, options: list[str], value: str, key: str) -> str:
+    return st.selectbox(
+        label,
+        options,
+        index=options.index(value) if value in options else 0,
+        format_func=lambda item: LABELS.get(item, item),
+        key=key,
+    )
 
-def fetch_ign_satellite_tile(xtile, ytile, zoom):
-    url = f"https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&STYLE=normal&FORMAT=image/jpeg&TILEMATRIXSET=PM&TILEMATRIX={zoom}&TILEROW={ytile}&TILECOL={xtile}"
-    try:
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200: return Image.open(io.BytesIO(res.content))
-    except: pass
-    return None
 
-# --- 5. STRENGE DEEP SCAN AI VERIFICATIE ---
-def deep_scan_tile_with_ai(base64_tile, kavel_dna_json):
-    if not client: return None
+def confirmed_confidence(old_value: str, new_value: str, old_confidence: float) -> float:
+    if new_value == "unknown":
+        return 0.0
+    if new_value != old_value:
+        return 0.95
+    return old_confidence
 
-    prompt = f"""
-    Jij bent een keiharde OSINT satelliet-expert. Scan deze hele satelliet-tegel.
-    Kavel-DNA profiel waarnaar we zoeken:
-    {json.dumps(kavel_dna_json)}
-    
-    BEOORDEEL STRENG OP DE VOLGENDE FACTOREN:
-    1. GROOTTE & VORM: Komt de voetafdruk/maat van het gebouw overeen?
-    2. BIJGEBOUWEN: Als het DNA zegt 'geen bijgebouwen', KEUR DAN elk boerderijcomplex met meerdere daken AF (score: laag).
-    3. VEGETATIE: Als het DNA bomen eist rondom het huis, keur dan huizen in een kaal weiland AF.
-    
-    Als je een gebouw vindt dat een écht goede kandidaat is, schat de positie in percentages (X=links naar rechts, Y=boven naar beneden).
-    
-    Retourneer een JSON:
-    {{
-      "matches": [
-          {{
-              "score": "hoog (uitstekende match) of medium (redelijke twijfelgeval, sluit niets uit)",
-              "redenering": "Verklaar waarom dit klopt qua maat, bomen en bijgebouwen.",
-              "x_percentage": 50,
-              "y_percentage": 50
-          }}
-      ]
-    }}
-    """
 
-    messages = [
-        {"type": "text", "text": prompt},
-        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_tile}"}}
-    ]
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": messages}],
-            response_format={"type": "json_object"},
-            max_tokens=800
-        )
-        result_json = json.loads(response.choices[0].message.content)
-        
-        valid_matches = []
-        for match in result_json.get("matches", []):
-            score = str(match.get("score", "laag")).lower()
-            if "hoog" in score or "medium" in score:
-                valid_matches.append({
-                    "x_perc": match.get("x_percentage", 50),
-                    "y_perc": match.get("y_percentage", 50),
-                    "score": "hoog" if "hoog" in score else "medium",
-                    "type": f"{match.get('redenering', '')}"
-                })
-        return valid_matches
-    except:
-        return None
-
-# --- SATELLIET KAART HULPFUNCTIE ---
-def create_satellite_map(lat, lon, zoom):
-    m = folium.Map(location=[lat, lon], zoom_start=zoom, tiles=None)
+def satellite_map(lat: float, lon: float, zoom: int = 15) -> folium.Map:
+    map_object = folium.Map(location=[lat, lon], zoom_start=zoom, tiles=None)
     folium.TileLayer(
-        tiles='https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&STYLE=normal&FORMAT=image/jpeg&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}',
-        attr='IGN Frankrijk', name='IGN Satelliet', overlay=False, control=True
-    ).add_to(m)
-    return m
+        tiles=(
+            "https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0"
+            "&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&STYLE=normal&FORMAT=image/jpeg"
+            "&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}"
+        ),
+        attr="IGN BD ORTHO",
+        name="IGN-luchtfoto",
+        overlay=False,
+        control=True,
+    ).add_to(map_object)
+    return map_object
 
-# --- 6. SIDEBAR ---
+
+initialize_state()
+ign, imagery = get_data_clients(str(SETTINGS.cache_dir))
+api_key = get_api_key()
+
+st.title("🏡 HouseFinder v2")
+st.caption(
+    "Alle gebouwen binnen de echte cirkel worden eerst met open Franse geo-data gevonden. "
+    "AI rangschikt alleen een kleine shortlist, met een harde kostengrens."
+)
+
 with st.sidebar:
     st.header("1. Woningfoto's")
-    uploaded_files = st.file_uploader("Upload foto's", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
-    
-    st.header("2. Locatie Bepalen")
-    location_method = st.radio("Kies methode:", ["Plaatsnaam + Kaart", "Link plakken", "Handmatig Lat/Lon"])
-    
-    if location_method == "Link plakken":
-        listing_url = st.text_input("Plak de URL (Bien'ici/Google Maps):")
-        if listing_url:
-            coords = extract_coords_from_url(listing_url)
-            if coords:
-                st.session_state.search_lat, st.session_state.search_lon = coords
-                st.success("Coördinaten ingeladen!")
-                
-    elif location_method == "Plaatsnaam + Kaart":
-        town_input = st.text_input("Plaatsnaam:", value="Aynac")
-        if town_input and town_input != st.session_state.last_town:
-            geo_coords = geocode_french_town(town_input)
-            if geo_coords:
-                st.session_state.map_center = [geo_coords[0], geo_coords[1]]
-                st.session_state.search_lat = geo_coords[0]
-                st.session_state.search_lon = geo_coords[1]
-                st.session_state.last_town = town_input
-                st.rerun()
+    uploaded_files = st.file_uploader(
+        "Upload maximaal zes bruikbare buitenfoto's",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+    )
+    if uploaded_files and len(uploaded_files) > SETTINGS.max_photos:
+        st.info(f"Alleen de eerste {SETTINGS.max_photos} foto's worden voor AI gebruikt.")
 
-    elif location_method == "Handmatig Lat/Lon":
-        st.session_state.search_lat = st.number_input("Lat", value=st.session_state.search_lat, format="%.6f")
-        st.session_state.search_lon = st.number_input("Lon", value=st.session_state.search_lon, format="%.6f")
+    current_photo_signature = file_signature(uploaded_files)
+    if current_photo_signature != st.session_state.photo_signature:
+        st.session_state.photo_signature = current_photo_signature
+        st.session_state.profile = ListingProfile.unknown().model_dump()
+        st.session_state.profile_revision += 1
+        st.session_state.ledger = None
+        st.session_state.search_result = None
+        st.session_state.result_signature = None
 
-    grid_size = st.slider("Zoekbereik (aantal tegels)", min_value=1, max_value=7, value=3, step=2)
-    start_search = st.button("Start Strenge AI Scan 🚀", type="primary")
+    st.header("2. Zoekcirkel")
+    place_query = st.text_input("Plaatsnaam", placeholder="Bijvoorbeeld Aynac")
+    if st.button("Zoek plaats", use_container_width=True):
+        result = ign.geocode(place_query)
+        if result:
+            lat, lon, label = result
+            st.session_state.search_lat = lat
+            st.session_state.search_lon = lon
+            st.success(label)
+            st.rerun()
+        else:
+            st.error("Plaats niet gevonden via de openbare Franse geocoder.")
 
-# --- 7. HOOFDWEERGAVE ---
-if not start_search and st.session_state.found_hits is None:
-    if uploaded_files:
-        cols = st.columns(min(len(uploaded_files), 3))
-        for i, photo in enumerate(uploaded_files):
-            with cols[i % 3]:
-                st.image(photo, width='stretch')
-        
-        st.divider()
-        if client:
-            with st.spinner("🤖 Kavel-DNA berekenen..."):
-                if st.session_state.ai_data is None:
-                    image_bytes_list = [f.getvalue() for f in uploaded_files]
-                    st.session_state.ai_data = analyze_photos_with_gpt4o(image_bytes_list)
-            if st.session_state.ai_data:
-                st.subheader("📊 Strikte Woning Blauwdruk")
-                st.json(st.session_state.ai_data)
-            
-    if location_method == "Plaatsnaam + Kaart":
-        st.divider()
-        st.subheader("📍 Plaats je zoek-pin")
-        m_select = folium.Map(location=st.session_state.map_center, zoom_start=13)
-        folium.Circle(location=[st.session_state.search_lat, st.session_state.search_lon], radius=grid_size * 180, color="red", fill=True, fill_opacity=0.3).add_to(m_select)
-        folium.Marker(location=[st.session_state.search_lat, st.session_state.search_lon], icon=folium.Icon(color="red")).add_to(m_select)
-        map_data = st_folium(m_select, width=1000, height=450, key="selection_map")
-        
-        if map_data and map_data.get("last_clicked"):
-            click_lat = map_data["last_clicked"]["lat"]
-            click_lon = map_data["last_clicked"]["lng"]
-            if click_lat != st.session_state.search_lat or click_lon != st.session_state.search_lon:
-                st.session_state.search_lat = click_lat
-                st.session_state.search_lon = click_lon
-                st.rerun()
+    listing_url = st.text_input("Of plak een Bien'ici-/Google Maps-link")
+    if st.button("Neem middelpunt over", use_container_width=True):
+        coords = extract_coords_from_url(listing_url)
+        if coords:
+            st.session_state.search_lat, st.session_state.search_lon = coords
+            st.rerun()
+        else:
+            st.error("In deze link zijn geen herkenbare coördinaten gevonden.")
 
-# --- 8. SCAN UITVOEREN ---
-if start_search:
-    st.divider()
-    st.subheader("🔍 Deep Scan Bezig met OSINT-regels...")
-    
-    lat_target = st.session_state.search_lat
-    lon_target = st.session_state.search_lon
-    ZOOM = 17
-    center_x, center_y = deg2num(lat_target, lon_target, ZOOM)
-    offset = grid_size // 2
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    total_tiles = grid_size * grid_size
-    step = 0
-    kavel_dna = st.session_state.ai_data
-    st.session_state.found_hits = []
+    st.number_input(
+        "Latitude", min_value=41.0, max_value=52.0, step=0.0001, format="%.6f", key="search_lat"
+    )
+    st.number_input(
+        "Longitude", min_value=-6.0, max_value=11.0, step=0.0001, format="%.6f", key="search_lon"
+    )
+    radius_m = st.slider("Straal van de makelaarscirkel", 100, 3_000, 600, 50, format="%d m")
 
-    for dx in range(-offset, offset + 1):
-        for dy in range(-offset, offset + 1):
-            step += 1
-            status_text.text(f"Tegel {step} van {total_tiles} streng beoordelen met AI. Even geduld...")
-            progress_bar.progress(step / total_tiles)
-            
-            tx = center_x + dx
-            ty = center_y + dy
-            tile_img = fetch_ign_satellite_tile(tx, ty, ZOOM)
-            
-            if tile_img and client:
-                buffered = io.BytesIO()
-                tile_img.save(buffered, format="JPEG")
-                base64_tile = base64.b64encode(buffered.getvalue()).decode('utf-8')
-                
-                matches = deep_scan_tile_with_ai(base64_tile, kavel_dna)
-                
-                if matches:
-                    nw_lat, nw_lon = num2deg(tx, ty, ZOOM)
-                    se_lat, se_lon = num2deg(tx + 1, ty + 1, ZOOM)
-                    
-                    for match in matches:
-                        hit_lon = nw_lon + (match["x_perc"] / 100.0) * (se_lon - nw_lon)
-                        hit_lat = nw_lat - (match["y_perc"] / 100.0) * (nw_lat - se_lat)
-                        st.session_state.found_hits.append({
-                            "lat": hit_lat, "lon": hit_lon, 
-                            "type": match["type"],
-                            "score": match["score"]
-                        })
-            
-    status_text.text("Scan Voltooid!")
-            
-# --- 9. RESULTATEN TONEN MET GOOGLE STREET VIEW LINKS ---
-if st.session_state.found_hits is not None:
-    st.divider()
-    hits = st.session_state.found_hits
-    if len(hits) > 0:
-        st.success(f"Deep Scan afgerond! {len(hits)} strenge kandidaten gevonden.")
+    st.header("3. Kosten")
+    budget_usd = st.slider(
+        "Maximale AI-kosten per woning",
+        min_value=0.01,
+        max_value=0.08,
+        value=SETTINGS.default_budget_usd,
+        step=0.01,
+        format="$%.2f",
+    )
+    use_terra = st.checkbox(
+        "Terra-eindcontrole bij twijfel",
+        value=True,
+        help="Wordt alleen uitgevoerd als de beste kandidaten dicht bij elkaar liggen én binnen het budget past.",
+    )
+    if api_key:
+        st.success("OpenAI-sleutel gevonden")
     else:
-        st.warning("Geen kandidaten gevonden. De AI heeft elk huis afgekeurd o.b.v. vorm, bijgebouwen of vegetatie.")
+        st.warning(
+            "Geen OpenAI-sleutel: de app blijft werken met handmatige aanwijzingen en lokale scoring."
+        )
 
-    m_results = create_satellite_map(st.session_state.search_lat, st.session_state.search_lon, 16)
-    folium.Circle(location=[st.session_state.search_lat, st.session_state.search_lon], radius=grid_size * 180, color="blue", fill=False).add_to(m_results)
-    
-    for hit in hits:
-        color = "green" if hit["score"] == "hoog" else "orange"
-        
-        # Hyperlinks genereren voor Google Maps & Street View
-        maps_link = f"https://www.google.com/maps/search/?api=1&query={hit['lat']},{hit['lon']}"
-        streetview_link = f"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={hit['lat']},{hit['lon']}"
-        
-        # HTML Pop-up
-        popup_html = f"""
-        <div style="font-family: Arial; font-size: 14px; min-width: 220px;">
-            <b style="color: {'green' if color == 'green' else '#d97706'};">Score: {hit['score'].upper()}</b><br>
-            <p style="margin-top: 5px; margin-bottom: 12px; font-size: 12px;">{hit['type']}</p>
-            <a href="{maps_link}" target="_blank" style="display:block; margin-bottom: 5px; text-decoration: none; color: #1a73e8;">🗺️ Open in Google Maps</a>
-            <a href="{streetview_link}" target="_blank" style="display:block; text-decoration: none; color: #1a73e8;">🚗 Open in Street View</a>
-        </div>
-        """
-        
-        folium.Marker(
-            location=[hit["lat"], hit["lon"]],
-            popup=folium.Popup(popup_html, max_width=300),
-            icon=folium.Icon(color=color, icon="check" if color=="green" else "search", prefix="fa") 
-        ).add_to(m_results)
-        
-    st_folium(m_results, width=1000, height=600)
-    
-    if st.button("⬅️ Terug naar aanpassen"):
-        st.session_state.found_hits = None
+
+if uploaded_files:
+    preview_columns = st.columns(min(3, len(uploaded_files)))
+    for index, uploaded in enumerate(uploaded_files[: SETTINGS.max_photos]):
+        with preview_columns[index % len(preview_columns)]:
+            st.image(uploaded, caption=f"Foto {index + 1}", width="stretch")
+
+prepared_photos = prepare_photos(
+    [uploaded.getvalue() for uploaded in uploaded_files or []],
+    SETTINGS.max_photos,
+    SETTINGS.max_photo_side,
+)
+
+st.subheader("Stap 1 · Aanwijzingen uit de foto's")
+analysis_col, cost_col = st.columns([2, 1])
+with analysis_col:
+    analyze_disabled = not prepared_photos or not api_key
+    if st.button(
+        "Foto's goedkoop analyseren met Luna",
+        type="primary",
+        disabled=analyze_disabled,
+        use_container_width=True,
+    ):
+        ledger = CostLedger.from_dict(st.session_state.ledger, budget_usd)
+        ai_service = OpenAIVisionService(api_key, SETTINGS)
+        try:
+            with st.spinner("Alleen vanuit de lucht bruikbare aanwijzingen bepalen..."):
+                profile = ai_service.analyze_listing_photos(prepared_photos, ledger)
+            st.session_state.profile = profile.model_dump()
+            st.session_state.profile_revision += 1
+            st.session_state.ledger = ledger.to_dict()
+            st.session_state.search_result = None
+            st.success("Fotoanalyse voltooid. Controleer de aanwijzingen hieronder.")
+            st.rerun()
+        except (AIServiceError, BudgetExceeded) as exc:
+            st.error(str(exc))
+
+with cost_col:
+    current_ledger = CostLedger.from_dict(st.session_state.ledger, budget_usd)
+    st.metric("AI-kosten tot nu toe", f"${current_ledger.total_usd:.4f}")
+    st.caption(f"Resterend hard budget: ${current_ledger.remaining_usd:.4f}")
+
+profile = ListingProfile.model_validate(st.session_state.profile)
+revision = st.session_state.profile_revision
+with st.expander("Controleer en corrigeer de aanwijzingen", expanded=True):
+    st.caption(
+        "Een handmatige wijziging krijgt hoge betrouwbaarheid. Zet ‘geen bijgebouwen’ alleen als harde "
+        "aanwijzing wanneer de foto's aantoonbaar de volledige kavel tonen."
+    )
+    with st.form(f"profile_form_{revision}"):
+        left, right = st.columns(2)
+        with left:
+            size_value = translated_selectbox(
+                "Relatieve grootte", SIZE_OPTIONS, profile.size_category, f"size_{revision}"
+            )
+            shape_value = translated_selectbox(
+                "Vermoedelijke voetafdruk",
+                SHAPE_OPTIONS,
+                profile.footprint_shape,
+                f"shape_{revision}",
+            )
+            outbuildings_value = st.number_input(
+                "Zichtbare losse bijgebouwen",
+                0,
+                9,
+                profile.outbuildings_visible,
+                key=f"outbuildings_{revision}",
+            )
+            absence_conclusive = st.checkbox(
+                "Afwezigheid van bijgebouwen is echt overtuigend",
+                value=profile.absence_of_outbuildings_conclusive,
+                key=f"absence_{revision}",
+            )
+        with right:
+            setting_value = translated_selectbox(
+                "Bebouwingscontext", SETTING_OPTIONS, profile.setting, f"setting_{revision}"
+            )
+            vegetation_value = translated_selectbox(
+                "Vegetatie", VEGETATION_OPTIONS, profile.vegetation, f"vegetation_{revision}"
+            )
+            road_value = translated_selectbox(
+                "Weg/oprit", ROAD_OPTIONS, profile.road_context, f"road_{revision}"
+            )
+            pool_value = translated_selectbox(
+                "Zwembad zichtbaar", TERNARY_OPTIONS, profile.pool_visible, f"pool_{revision}"
+            )
+        st.write(profile.summary)
+        save_profile = st.form_submit_button("Aanwijzingen opslaan", use_container_width=True)
+
+    if save_profile:
+        updated = profile.model_copy(
+            update={
+                "size_category": size_value,
+                "size_confidence": confirmed_confidence(
+                    profile.size_category, size_value, profile.size_confidence
+                ),
+                "footprint_shape": shape_value,
+                "shape_confidence": confirmed_confidence(
+                    profile.footprint_shape, shape_value, profile.shape_confidence
+                ),
+                "outbuildings_visible": int(outbuildings_value),
+                "outbuildings_confidence": (
+                    0.95
+                    if int(outbuildings_value) != profile.outbuildings_visible
+                    else profile.outbuildings_confidence
+                ),
+                "absence_of_outbuildings_conclusive": absence_conclusive,
+                "setting": setting_value,
+                "setting_confidence": confirmed_confidence(
+                    profile.setting, setting_value, profile.setting_confidence
+                ),
+                "vegetation": vegetation_value,
+                "vegetation_confidence": confirmed_confidence(
+                    profile.vegetation, vegetation_value, profile.vegetation_confidence
+                ),
+                "road_context": road_value,
+                "road_confidence": confirmed_confidence(
+                    profile.road_context, road_value, profile.road_confidence
+                ),
+                "pool_visible": pool_value,
+                "pool_confidence": confirmed_confidence(
+                    profile.pool_visible, pool_value, profile.pool_confidence
+                ),
+                "summary": "Door gebruiker gecontroleerd profiel.",
+            }
+        )
+        st.session_state.profile = updated.model_dump()
+        st.session_state.profile_revision += 1
+        st.session_state.search_result = None
+        st.success("Aanwijzingen opgeslagen.")
         st.rerun()
+
+st.subheader("Stap 2 · Controleer de exacte cirkel")
+selection_map = satellite_map(st.session_state.search_lat, st.session_state.search_lon, 14)
+folium.Circle(
+    location=[st.session_state.search_lat, st.session_state.search_lon],
+    radius=radius_m,
+    color="#ef4444",
+    weight=3,
+    fill=True,
+    fill_opacity=0.12,
+    tooltip=f"Werkelijk zoekgebied: straal {radius_m} m",
+).add_to(selection_map)
+folium.Marker(
+    [st.session_state.search_lat, st.session_state.search_lon],
+    tooltip="Middelpunt",
+    icon=folium.Icon(color="red", icon="crosshairs", prefix="fa"),
+).add_to(selection_map)
+selection_data = st_folium(selection_map, height=420, use_container_width=True, key="selection_map")
+if selection_data and selection_data.get("last_clicked"):
+    click = selection_data["last_clicked"]
+    if (
+        abs(click["lat"] - st.session_state.search_lat) > 1e-7
+        or abs(click["lng"] - st.session_state.search_lon) > 1e-7
+    ):
+        st.session_state.search_lat = click["lat"]
+        st.session_state.search_lon = click["lng"]
+        st.rerun()
+
+run_disabled = not (
+    41.0 <= st.session_state.search_lat <= 52.0 and -6.0 <= st.session_state.search_lon <= 11.0
+)
+if st.button(
+    "Zoek en rangschik alle gebouwen binnen de cirkel",
+    type="primary",
+    disabled=run_disabled,
+    use_container_width=True,
+):
+    ledger = CostLedger.from_dict(st.session_state.ledger, budget_usd)
+    ai_service = OpenAIVisionService(api_key, SETTINGS) if api_key else None
+    progress_bar = st.progress(0.0)
+    status_text = st.empty()
+
+    def update_status(message: str, progress: float) -> None:
+        status_text.write(message)
+        progress_bar.progress(progress)
+
+    try:
+        result = run_search(
+            center_lat=st.session_state.search_lat,
+            center_lon=st.session_state.search_lon,
+            radius_m=radius_m,
+            profile=ListingProfile.model_validate(st.session_state.profile),
+            photos=prepared_photos,
+            settings=SETTINGS,
+            ign=ign,
+            imagery=imagery,
+            ledger=ledger,
+            ai=ai_service,
+            use_terra_when_ambiguous=use_terra,
+            status=update_status,
+        )
+        st.session_state.search_result = result
+        st.session_state.ledger = ledger.to_dict()
+        st.session_state.result_signature = selection_signature(
+            st.session_state.search_lat,
+            st.session_state.search_lon,
+            radius_m,
+            st.session_state.photo_signature,
+        )
+        st.rerun()
+    except IGNError as exc:
+        st.error(str(exc))
+    except Exception as exc:
+        st.exception(exc)
+
+result: SearchResult | None = st.session_state.search_result
+if result:
+    st.divider()
+    st.subheader("Resultaten")
+    active_signature = selection_signature(
+        st.session_state.search_lat,
+        st.session_state.search_lon,
+        radius_m,
+        st.session_state.photo_signature,
+    )
+    if active_signature != st.session_state.result_signature:
+        st.warning(
+            "De foto's of cirkel zijn gewijzigd. Start de zoekopdracht opnieuw voor actuele resultaten."
+        )
+
+    ledger = CostLedger.from_dict(st.session_state.ledger, budget_usd)
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Gebouwen in cirkel", result.total_buildings)
+    metric_columns[1].metric("AI-shortlist", result.shortlist_size)
+    metric_columns[2].metric("Getoonde kandidaten", len(result.candidates))
+    metric_columns[3].metric("Werkelijke AI-kosten", f"${ledger.total_usd:.4f}")
+
+    for warning in result.warnings:
+        st.warning(warning)
+
+    results_map = satellite_map(st.session_state.search_lat, st.session_state.search_lon, 15)
+    folium.Circle(
+        [st.session_state.search_lat, st.session_state.search_lon],
+        radius=radius_m,
+        color="#2563eb",
+        weight=3,
+        fill=False,
+    ).add_to(results_map)
+    for rank, candidate in enumerate(result.candidates, start=1):
+        maps_link = (
+            f"https://www.google.com/maps/search/?api=1&query={candidate.lat},{candidate.lon}"
+        )
+        popup = (
+            f"<b>#{rank} · {html.escape(candidate.candidate_id)}</b><br>"
+            f"Score: {candidate.final_score:.1f}/100<br>"
+            f"Voetafdruk: {candidate.area_m2:.0f} m²<br>"
+            f"<a href='{maps_link}' target='_blank'>Open in Google Maps</a>"
+        )
+        color = "green" if rank <= 3 else "orange" if rank <= 8 else "blue"
+        folium.Marker(
+            [candidate.lat, candidate.lon],
+            tooltip=f"#{rank} · {candidate.final_score:.1f}",
+            popup=folium.Popup(popup, max_width=300),
+            icon=folium.Icon(color=color, icon="home", prefix="fa"),
+        ).add_to(results_map)
+    st_folium(results_map, height=560, use_container_width=True, key="results_map")
+
+    st.subheader("Kandidaten in volgorde")
+    card_columns = st.columns(2)
+    for rank, candidate in enumerate(result.candidates, start=1):
+        with card_columns[(rank - 1) % 2]:
+            with st.container(border=True):
+                st.markdown(
+                    f"### #{rank} · {candidate.candidate_id} — {candidate.final_score:.1f}/100"
+                )
+                if candidate.crop_path and Path(candidate.crop_path).exists():
+                    st.image(
+                        candidate.crop_path,
+                        caption="Rood: kandidaatcontour · noord is boven",
+                        width="stretch",
+                    )
+                score_parts = [f"lokaal {candidate.local_score:.1f}"]
+                if candidate.luna_score is not None:
+                    score_parts.append(f"Luna {candidate.luna_score:.1f}")
+                if candidate.terra_score is not None:
+                    score_parts.append(f"Terra {candidate.terra_score:.1f}")
+                st.caption(" · ".join(score_parts))
+                st.write(
+                    f"**{candidate.area_m2:.0f} m²** · {LABELS.get(candidate.size_class, candidate.size_class)} · "
+                    f"{LABELS.get(candidate.shape_class, candidate.shape_class)} · "
+                    f"{candidate.buildings_within_50m} andere contour(en) binnen 50 m"
+                )
+                if candidate.reasons:
+                    st.markdown(
+                        "**Sterke punten**\n\n"
+                        + "\n".join(f"- {item}" for item in candidate.reasons)
+                    )
+                if candidate.conflicts:
+                    st.markdown(
+                        "**Tegenstrijdigheden**\n\n"
+                        + "\n".join(f"- {item}" for item in candidate.conflicts)
+                    )
+                if candidate.uncertainties:
+                    st.markdown(
+                        "**Onzekerheden**\n\n"
+                        + "\n".join(f"- {item}" for item in candidate.uncertainties)
+                    )
+                maps_link = f"https://www.google.com/maps/search/?api=1&query={candidate.lat},{candidate.lon}"
+                street_link = (
+                    "https://www.google.com/maps/@?api=1&map_action=pano&viewpoint="
+                    f"{candidate.lat},{candidate.lon}"
+                )
+                st.markdown(f"[Google Maps]({maps_link}) · [Street View]({street_link})")
+
+    if ledger.entries:
+        with st.expander("Kostenlog"):
+            st.dataframe(
+                [
+                    {
+                        "stap": entry.label,
+                        "model": entry.model,
+                        "inputtokens": entry.input_tokens,
+                        "outputtokens": entry.output_tokens,
+                        "kosten_usd": round(entry.cost_usd, 6),
+                        "geschat": entry.estimated,
+                    }
+                    for entry in ledger.entries
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.caption(
+        "Dit is een kandidaat-rangschikking, geen bewijs van een exacte locatie. Controleer altijd meerdere "
+        "aanwijzingen en houd rekening met het opnamejaar van de luchtfoto."
+    )
