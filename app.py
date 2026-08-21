@@ -100,6 +100,15 @@ def initialize_state() -> None:
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
 
+    # Map clicks happen after the latitude/longitude widgets are rendered.
+    # Apply them at the start of the next run, before those widgets exist.
+    pending_center = st.session_state.pop("pending_search_center", None)
+    if pending_center:
+        st.session_state.search_lat = float(pending_center["lat"])
+        st.session_state.search_lon = float(pending_center["lon"])
+        st.session_state.search_result = None
+        st.session_state.result_signature = None
+
 
 def translated_selectbox(label: str, options: list[str], value: str, key: str) -> str:
     return st.selectbox(
@@ -358,6 +367,7 @@ with st.expander("Controleer en corrigeer de aanwijzingen", expanded=True):
         st.rerun()
 
 st.subheader("Stap 2 · Controleer de exacte cirkel")
+st.caption("Klik op de kaart om de rode speld en zoekcirkel te verplaatsen.")
 selection_map = street_map(st.session_state.search_lat, st.session_state.search_lon, 14)
 folium.Circle(
     location=[st.session_state.search_lat, st.session_state.search_lon],
@@ -380,8 +390,10 @@ if selection_data and selection_data.get("last_clicked"):
         abs(click["lat"] - st.session_state.search_lat) > 1e-7
         or abs(click["lng"] - st.session_state.search_lon) > 1e-7
     ):
-        st.session_state.search_lat = click["lat"]
-        st.session_state.search_lon = click["lng"]
+        st.session_state.pending_search_center = {
+            "lat": float(click["lat"]),
+            "lon": float(click["lng"]),
+        }
         st.rerun()
 
 run_disabled = not (
