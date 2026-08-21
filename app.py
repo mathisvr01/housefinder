@@ -119,6 +119,16 @@ def confirmed_confidence(old_value: str, new_value: str, old_confidence: float) 
     return old_confidence
 
 
+def street_map(lat: float, lon: float, zoom: int = 14) -> folium.Map:
+    """Regular road map for selecting the search-circle centre."""
+    return folium.Map(
+        location=[lat, lon],
+        zoom_start=zoom,
+        tiles="OpenStreetMap",
+        control_scale=True,
+    )
+
+
 def satellite_map(lat: float, lon: float, zoom: int = 15) -> folium.Map:
     map_object = folium.Map(location=[lat, lon], zoom_start=zoom, tiles=None)
     folium.TileLayer(
@@ -348,7 +358,7 @@ with st.expander("Controleer en corrigeer de aanwijzingen", expanded=True):
         st.rerun()
 
 st.subheader("Stap 2 · Controleer de exacte cirkel")
-selection_map = satellite_map(st.session_state.search_lat, st.session_state.search_lon, 14)
+selection_map = street_map(st.session_state.search_lat, st.session_state.search_lon, 14)
 folium.Circle(
     location=[st.session_state.search_lat, st.session_state.search_lon],
     radius=radius_m,
